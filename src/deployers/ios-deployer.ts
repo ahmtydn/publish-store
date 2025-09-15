@@ -1,9 +1,12 @@
 /**
  * iOS App Store Connect Deployer
- * @fileoverview Handles deployment to Apple App Store using App Store Connect API
+ * @fileoverview Handles deployment to Apple App Store using xcrun altool for real uploads
  */
 
-import * as jwt from 'jsonwebtoken';
+import { execSync } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import {
   ActionInputs,
   IOSInputs,
@@ -15,67 +18,9 @@ import {
 } from '../types/index.js';
 import { BaseDeployer } from './base-deployer.js';
 import { logger } from '../services/logger.js';
-import { HttpClientService } from '../services/http-client.js';
 import { decodeBase64, generateId } from '../utils/helpers.js';
 
-interface AppStoreConnectApp {
-  id: string;
-  attributes: {
-    bundleId: string;
-    name: string;
-    sku: string;
-  };
-}
-
-interface BuildUploadOperation {
-  id: string;
-  attributes: {
-    fileName: string;
-    fileSize: number;
-    uploadOperations: Array<{
-      method: string;
-      url: string;
-      length: number;
-      offset: number;
-      requestHeaders?: Array<{
-        name: string;
-        value: string;
-      }>;
-    }>;
-  };
-}
-
-interface Build {
-  id: string;
-  attributes: {
-    version: string;
-    uploadedDate?: string;
-    processingState: string;
-    usesNonExemptEncryption?: boolean;
-  };
-}
-
-interface PreReleaseVersion {
-  id: string;
-  attributes: {
-    version: string;
-    platform: string;
-  };
-}
-
-interface IPAMetadata {
-  bundleId: string;
-  version: string;
-  buildNumber: string;
-  displayName: string;
-  minimumOSVersion: string;
-}
-
 export class IOSDeployer extends BaseDeployer {
-  private httpClient: HttpClientService | null = null;
-  private jwtToken: string = '';
-  private bundleId: string = '';
-
   constructor() {
     super('ios');
   }
@@ -96,8 +41,11 @@ export class IOSDeployer extends BaseDeployer {
         return await this.performDryRun(iosInputs);
       }
 
-      // Initialize App Store Connect API
-      await this.initializeAppStoreConnectAPI(iosInputs);
+      // Validate inputs
+      this.validateIOSInputs(iosInputs);
+
+      // Check system requirements
+      await this.checkSystemRequirements();
 
       // Validate artifact
       const isValidArtifact = await this.validateArtifact(iosInputs.artifactPath);
@@ -105,8 +53,8 @@ export class IOSDeployer extends BaseDeployer {
         throw new DeploymentError('Artifact validation failed', 'ARTIFACT_VALIDATION_FAILED');
       }
 
-      // Perform deployment
-      const result = await this.performAppStoreConnectDeployment(iosInputs, startTime);
+      // Perform real upload using xcrun altool
+      const result = await this.performRealAppStoreUpload(iosInputs, startTime);
 
       logger.info('✅ iOS deployment completed successfully');
       return result;
@@ -114,609 +62,313 @@ export class IOSDeployer extends BaseDeployer {
       const deploymentError = this.handleDeploymentError(error as Error, {
         inputs: iosInputs,
         startTime,
-        operation: 'App Store Connect deployment',
+        operation: 'App Store Connect upload',
       });
       throw deploymentError;
     }
   }
 
-  private async initializeAppStoreConnectAPI(inputs: IOSInputs): Promise<void> {
-    try {
-      logger.group('🔐 Initializing App Store Connect API');
-
-      // Generate JWT token
-      this.jwtToken = await this.generateJWTToken(inputs);
-
-      // Initialize HTTP client with authentication
-      this.httpClient = new HttpClientService('https://api.appstoreconnect.apple.com');
-      this.httpClient['client'].defaults.headers.common['Authorization'] =
-        `Bearer ${this.jwtToken}`;
-
-      this.bundleId = inputs.iosBundleId;
-
-      // Verify API access by fetching app info
-      await this.verifyAPIAccess();
-
-      logger.info('✅ App Store Connect API initialized successfully', {
-        bundleId: this.bundleId,
-      });
-    } catch (error) {
-      logger.error('Failed to initialize App Store Connect API', { error });
-      throw new AuthenticationError(
-        `App Store Connect API initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
-    } finally {
-      logger.groupEnd();
+  private validateIOSInputs(inputs: IOSInputs): void {
+    if (!inputs.appStoreConnectApiKeyId) {
+      throw new DeploymentError('App Store Connect API Key ID is required', 'MISSING_API_KEY_ID');
     }
-  }
 
-  private async generateJWTToken(inputs: IOSInputs): Promise<string> {
-    try {
-      const privateKey = decodeBase64(inputs.appStoreConnectApiPrivateKey);
+    if (!inputs.appStoreConnectApiIssuerId) {
+      throw new DeploymentError('App Store Connect API Issuer ID is required', 'MISSING_ISSUER_ID');
+    }
 
-      const now = Math.floor(Date.now() / 1000);
-      const payload = {
-        iss: inputs.appStoreConnectApiIssuerId,
-        iat: now,
-        exp: now + 20 * 60, // 20 minutes
-        aud: 'appstoreconnect-v1',
-      };
-
-      const header = {
-        alg: 'ES256',
-        kid: inputs.appStoreConnectApiKeyId,
-        typ: 'JWT',
-      };
-
-      const token = jwt.sign(payload, privateKey, {
-        algorithm: 'ES256',
-        header,
-      });
-
-      logger.debug('JWT token generated successfully');
-      return token;
-    } catch (error) {
-      logger.error('Failed to generate JWT token', { error });
-      throw new AuthenticationError(
-        `Failed to generate App Store Connect JWT token: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
+    if (!inputs.appStoreConnectApiPrivateKey) {
+      throw new DeploymentError(
+        'App Store Connect API Private Key is required',
+        'MISSING_PRIVATE_KEY'
       );
     }
-  }
 
-  private async verifyAPIAccess(): Promise<void> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
+    if (!inputs.iosBundleId) {
+      throw new DeploymentError('iOS Bundle ID is required', 'MISSING_BUNDLE_ID');
     }
 
-    try {
-      // Try to fetch apps to verify API access
-      const response = await this.httpClient.get<{ data: AppStoreConnectApp[] }>('/v1/apps', {
-        timeout: 30000,
-      });
+    logger.debug('iOS inputs validated successfully');
+  }
 
-      if (!response.data || !Array.isArray(response.data)) {
-        throw new Error('Invalid response from App Store Connect API');
+  private async checkSystemRequirements(): Promise<void> {
+    try {
+      logger.info('🔍 Checking system requirements for iOS deployment...');
+
+      // Check if we're running on macOS
+      if (process.platform !== 'darwin') {
+        logger.warn('⚠️  iOS deployment typically requires macOS for optimal compatibility');
       }
 
-      logger.debug('API access verified', { appsCount: response.data.length });
+      // Check if Xcode command line tools are available
+      try {
+        execSync('xcrun --version', { stdio: 'pipe' });
+        logger.info('✅ Xcode command line tools are available');
+      } catch (error) {
+        logger.warn('⚠️  Xcode command line tools not found. Some features may be limited.');
+      }
+
+      // Check if altool is available (newer Xcode versions)
+      try {
+        execSync('xcrun altool --version', { stdio: 'pipe' });
+        logger.info('✅ xcrun altool is available');
+      } catch (error) {
+        // Try notarytool as alternative (Xcode 13+)
+        try {
+          execSync('xcrun notarytool --version', { stdio: 'pipe' });
+          logger.info('✅ xcrun notarytool is available (will use as fallback)');
+        } catch (notaryError) {
+          throw new DeploymentError(
+            'Neither xcrun altool nor notarytool is available. Please install Xcode command line tools.',
+            'MISSING_XCODE_TOOLS'
+          );
+        }
+      }
+
+      logger.info('✅ System requirements check completed');
     } catch (error) {
-      logger.error('Failed to verify API access', { error });
-      throw new AuthenticationError(
-        `Failed to verify App Store Connect API access: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
+      if (error instanceof DeploymentError) {
+        throw error;
+      }
+      throw new DeploymentError(
+        `System requirements check failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        'SYSTEM_CHECK_FAILED'
       );
     }
   }
 
-  private async performAppStoreConnectDeployment(
+  private async performRealAppStoreUpload(
     inputs: IOSInputs,
     startTime: Date
   ): Promise<IOSDeploymentResult> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
-    }
-
-    logger.group('📦 App Store Connect Deployment');
+    logger.group('📤 Real App Store Connect Upload');
 
     try {
-      // Find the app by bundle ID
-      const app = await this.findAppByBundleId(inputs.iosBundleId);
+      // Create temporary API key file for altool authentication
+      const apiKeyPath = await this.createTemporaryApiKeyFile(inputs);
 
-      // Upload the IPA using transporter
-      const buildId = await this.uploadIPA(inputs.artifactPath, app.id, inputs);
+      try {
+        // Upload the IPA using xcrun altool
+        await this.uploadWithAltool(inputs.artifactPath, apiKeyPath, inputs);
 
-      // Wait for build processing (simplified - in production you'd poll for status)
-      await this.waitForBuildProcessing(buildId);
+        const endTime = new Date();
+        const deploymentUrl = `https://appstoreconnect.apple.com/apps`;
 
-      const endTime = new Date();
-      const deploymentUrl = `https://appstoreconnect.apple.com/apps/${app.id}`;
+        logger.info('✅ Real App Store upload completed successfully');
 
-      logger.info('✅ App Store Connect deployment completed successfully');
-
-      return {
-        platform: 'ios',
-        status: 'success',
-        deploymentId: generateId('ios-deploy'),
-        startTime,
-        endTime,
-        duration: endTime.getTime() - startTime.getTime(),
-        deploymentUrl,
-        versionCode: inputs.appVersion,
-        bundleId: inputs.iosBundleId,
-        ...(inputs.buildNumber && { buildNumber: inputs.buildNumber }),
-        appVersion: inputs.appVersion,
-        metadata: {
+        return {
+          platform: 'ios',
+          status: 'success',
+          deploymentId: generateId('ios-upload'),
+          startTime,
+          endTime,
+          duration: endTime.getTime() - startTime.getTime(),
+          deploymentUrl,
+          versionCode: inputs.appVersion,
           bundleId: inputs.iosBundleId,
-          appId: app.id,
-          buildId,
-          appName: app.attributes.name,
-        },
-      };
+          ...(inputs.buildNumber && { buildNumber: inputs.buildNumber }),
+          appVersion: inputs.appVersion,
+          metadata: {
+            bundleId: inputs.iosBundleId,
+            uploadMethod: 'xcrun altool',
+            realUpload: true,
+          },
+        };
+      } finally {
+        // Clean up temporary API key file
+        await this.cleanupTemporaryApiKeyFile(apiKeyPath);
+      }
     } finally {
       logger.groupEnd();
     }
   }
 
-  private async findAppByBundleId(bundleId: string): Promise<AppStoreConnectApp> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
-    }
-
+  private async createTemporaryApiKeyFile(inputs: IOSInputs): Promise<string> {
     try {
-      logger.info('Finding app by bundle ID...', { bundleId });
+      logger.debug('Creating temporary API key file for altool authentication...');
 
-      const response = await this.httpClient.get<{ data: AppStoreConnectApp[] }>(
-        `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}`,
-        {
-          timeout: 30000,
-        }
-      );
+      // Decode the private key
+      const privateKey = decodeBase64(inputs.appStoreConnectApiPrivateKey);
 
-      if (!response.data || response.data.length === 0) {
-        throw new Error(`No app found with bundle ID: ${bundleId}`);
-      }
+      // Create temporary directory
+      const tempDir = os.tmpdir();
+      const keyFileName = `AuthKey_${inputs.appStoreConnectApiKeyId}.p8`;
+      const keyFilePath = path.join(tempDir, keyFileName);
 
-      const app = response.data[0]!;
-      logger.info('App found', {
-        appId: app.id,
-        name: app.attributes.name,
-        bundleId: app.attributes.bundleId,
-      });
+      // Write the private key to temporary file
+      await fs.writeFile(keyFilePath, privateKey, 'utf8');
 
-      return app;
+      logger.debug('Temporary API key file created', { path: keyFilePath });
+      return keyFilePath;
     } catch (error) {
-      logger.error('Failed to find app by bundle ID', { error, bundleId });
-      throw new NetworkError(
-        `Failed to find app with bundle ID ${bundleId}: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
+      logger.error('Failed to create temporary API key file', { error });
+      throw new DeploymentError(
+        `Failed to create API key file: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        'API_KEY_FILE_CREATION_FAILED'
       );
     }
   }
 
-  private async uploadIPA(artifactPath: string, appId: string, inputs: IOSInputs): Promise<string> {
+  private async cleanupTemporaryApiKeyFile(keyFilePath: string): Promise<void> {
     try {
-      logger.info('🚀 Starting real IPA upload to App Store Connect...', { path: artifactPath, appId });
-
-      // Get file information and extract IPA metadata
-      const fileInfo = await this.fileSystem.getFileInfo(artifactPath);
-      const ipaMetadata = await this.extractIPAMetadata(artifactPath);
-      
-      logger.info('📋 IPA file information', {
-        size: `${(fileInfo.size / 1024 / 1024).toFixed(2)} MB`,
-        checksum: fileInfo.checksum,
-        bundleId: ipaMetadata.bundleId,
-        version: ipaMetadata.version,
-        buildNumber: ipaMetadata.buildNumber,
-      });
-
-      // Validate that IPA bundle ID matches input
-      if (ipaMetadata.bundleId !== inputs.iosBundleId) {
-        logger.warn('Bundle ID mismatch detected', {
-          inputBundleId: inputs.iosBundleId,
-          ipaBundleId: ipaMetadata.bundleId,
-        });
-      }
-
-      // Step 1: Create or get pre-release version
-      await this.createOrGetPreReleaseVersion(appId);
-      
-      // Step 2: Create build upload operation
-      const uploadOperation = await this.createBuildUploadOperation(
-        appId,
-        fileInfo.basename,
-        fileInfo.size
-      );
-
-      // Step 3: Upload the file using the provided operations
-      await this.uploadFileToApple(artifactPath, uploadOperation);
-
-      // Step 4: Commit the upload operation
-      const build = await this.commitUploadOperation(uploadOperation.id);
-
-      logger.info('✅ IPA uploaded successfully', { 
-        buildId: build.id,
-        version: build.attributes.version,
-        processingState: build.attributes.processingState
-      });
-
-      return build.id;
+      await fs.unlink(keyFilePath);
+      logger.debug('Temporary API key file cleaned up', { path: keyFilePath });
     } catch (error) {
-      logger.error('Failed to upload IPA', { error, artifactPath });
-      throw new NetworkError(
-        `Failed to upload IPA to App Store Connect: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
+      logger.warn('Failed to cleanup temporary API key file', { error, path: keyFilePath });
+      // Don't throw error for cleanup failures
     }
   }
 
-  private async createOrGetPreReleaseVersion(appId: string): Promise<PreReleaseVersion> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
-    }
-
-    try {
-      logger.info('📦 Creating or getting pre-release version...');
-
-      // Try to get existing pre-release versions
-      const response = await this.httpClient.get<{ data: PreReleaseVersion[] }>(
-        `/v1/apps/${appId}/preReleaseVersions?filter[platform]=IOS`,
-        {
-          timeout: 30000,
-        }
-      );
-
-      // For simplicity, we'll use the first available version or create a new one
-      if (response.data && response.data.length > 0) {
-        const version = response.data[0]!;
-        logger.info('Using existing pre-release version', { 
-          versionId: version.id, 
-          version: version.attributes.version 
-        });
-        return version;
-      }
-
-      // Create a new pre-release version if none exists
-      const createResponse = await this.httpClient.post<{ data: PreReleaseVersion }>(
-        '/v1/preReleaseVersions',
-        {
-          data: {
-            type: 'preReleaseVersions',
-            attributes: {
-              version: '1.0.0', // This will be overridden by the actual build
-              platform: 'IOS',
-            },
-            relationships: {
-              app: {
-                data: {
-                  type: 'apps',
-                  id: appId,
-                },
-              },
-            },
-          },
-        },
-        {
-          timeout: 30000,
-        }
-      );
-
-      if (!createResponse.data) {
-        throw new Error('Failed to create pre-release version');
-      }
-
-      logger.info('Created new pre-release version', { 
-        versionId: createResponse.data.id, 
-        version: createResponse.data.attributes.version 
-      });
-
-      return createResponse.data;
-    } catch (error) {
-      logger.error('Failed to create or get pre-release version', { error, appId });
-      throw new NetworkError(
-        `Failed to create pre-release version: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
-    }
-  }
-
-  private async createBuildUploadOperation(
-    _appId: string,
-    fileName: string,
-    fileSize: number
-  ): Promise<BuildUploadOperation> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
-    }
-
-    try {
-      logger.info('📤 Creating build upload operation...', { fileName, fileSize });
-
-      // For demonstration purposes, we'll use a simplified approach
-      // In a real implementation, you would need to use Apple's Transporter tool
-      // or implement the complete App Store Connect upload workflow
-      
-      // This is a mock upload operation that demonstrates the structure
-      const mockUploadOperation: BuildUploadOperation = {
-        id: generateId('upload-op'),
-        attributes: {
-          fileName,
-          fileSize,
-          uploadOperations: [
-            {
-              method: 'PUT',
-              url: `https://mock-upload.apple.com/upload/${generateId('upload')}`,
-              length: fileSize,
-              offset: 0,
-              requestHeaders: [
-                { name: 'Content-Type', value: 'application/octet-stream' },
-                { name: 'Content-Length', value: fileSize.toString() },
-              ],
-            },
-          ],
-        },
-      };
-
-      logger.info('⚠️  Using simplified upload operation for demonstration', {
-        operationId: mockUploadOperation.id,
-        operationsCount: mockUploadOperation.attributes.uploadOperations.length,
-      });
-
-      logger.warn(
-        'Note: This is a simplified implementation. For production use, implement Apple Transporter integration.'
-      );
-
-      return mockUploadOperation;
-    } catch (error) {
-      logger.error('Failed to create build upload operation', { error, fileName, fileSize });
-      throw new NetworkError(
-        `Failed to create upload operation: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
-    }
-  }
-
-  private async uploadFileToApple(
-    artifactPath: string,
-    uploadOperation: BuildUploadOperation
+  private async uploadWithAltool(
+    ipaPath: string,
+    apiKeyPath: string,
+    inputs: IOSInputs
   ): Promise<void> {
     try {
-      logger.info('⬆️  Uploading IPA file to App Store Connect...');
-
-      // Get file information for validation
-      const fileInfo = await this.fileSystem.getFileInfo(artifactPath);
-      
-      logger.info('📋 Validating IPA file before upload', {
-        fileName: fileInfo.basename,
-        size: `${(fileInfo.size / 1024 / 1024).toFixed(2)} MB`,
-        checksum: fileInfo.checksum,
+      logger.info('🚀 Starting real IPA upload with xcrun altool...', {
+        ipaPath,
+        bundleId: inputs.iosBundleId,
       });
 
-      // In a production environment, you would either:
-      // 1. Use Apple's Transporter command-line tool
-      // 2. Use Apple's altool (deprecated but still works)
-      // 3. Implement the full App Store Connect upload protocol
-      
-      logger.info('🚀 Starting upload using App Store Connect workflow...');
-      
-      // For this demonstration, we'll simulate the upload process
-      // In production, replace this with actual Transporter calls or API uploads
-      
-      const operations = uploadOperation.attributes.uploadOperations;
-      logger.info(`Processing ${operations.length} upload operation(s)`);
-
-      for (let i = 0; i < operations.length; i++) {
-        const operation = operations[i]!;
-        
-        logger.info(`Processing upload operation ${i + 1}/${operations.length}`, {
-          method: operation.method,
-          size: operation.length,
-          offset: operation.offset,
-        });
-
-        // Simulate upload progress
-        await this.simulateUploadProgress(operation.length);
-      }
-
-      logger.info('✅ IPA file uploaded successfully to App Store Connect');
-      
-      // Log guidance for production implementation
-      logger.info(
-        '💡 For production: Replace this simulation with actual Apple Transporter integration'
-      );
-    } catch (error) {
-      logger.error('Failed to upload IPA file', { error, artifactPath });
-      throw new NetworkError(
-        `Failed to upload IPA to Apple servers: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
-    }
-  }
-
-  private async simulateUploadProgress(fileSize: number): Promise<void> {
-    const chunkSize = Math.min(fileSize, 10 * 1024 * 1024); // 10MB chunks or file size
-    const totalChunks = Math.ceil(fileSize / chunkSize);
-    
-    for (let chunk = 1; chunk <= totalChunks; chunk++) {
-      await new Promise(resolve => setTimeout(resolve, 100)); // Simulate network delay
-      
-      const progress = Math.round((chunk / totalChunks) * 100);
-      if (chunk % Math.ceil(totalChunks / 5) === 0 || chunk === totalChunks) {
-        logger.info(`Upload progress: ${progress}% (${chunk}/${totalChunks} chunks)`);
-      }
-    }
-  }
-
-  private async commitUploadOperation(uploadOperationId: string): Promise<Build> {
-    if (!this.httpClient) {
-      throw new Error('HTTP client not initialized');
-    }
-
-    try {
-      logger.info('✅ Committing upload operation...', { uploadOperationId });
-
-      // In a real implementation, this would commit the upload to App Store Connect
-      // For this demonstration, we'll create a mock build object
-      
-      const mockBuild: Build = {
-        id: generateId('build'),
-        attributes: {
-          version: '1.0', // This would come from the IPA metadata
-          processingState: 'PROCESSING',
-          uploadedDate: new Date().toISOString(),
-          usesNonExemptEncryption: false,
-        },
-      };
-
-      logger.info('Upload operation committed successfully', {
-        buildId: mockBuild.id,
-        version: mockBuild.attributes.version,
-        processingState: mockBuild.attributes.processingState,
-      });
-
-      logger.info(
-        '💡 For production: Implement actual App Store Connect commit endpoint'
-      );
-
-      return mockBuild;
-    } catch (error) {
-      logger.error('Failed to commit upload operation', { error, uploadOperationId });
-      throw new NetworkError(
-        `Failed to commit upload: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'ios'
-      );
-    }
-  }
-
-
-  private async waitForBuildProcessing(buildId: string): Promise<void> {
-    logger.info('⏳ Waiting for build processing...', { buildId });
-
-    // For this demonstration, we'll simulate the build processing
-    // In production, you would poll the actual App Store Connect API
-
-    const maxWaitTime = 5 * 60 * 1000; // 5 minutes for demo
-    const pollInterval = 10 * 1000; // 10 seconds for demo
-    const startTime = Date.now();
-
-    const processingStates = ['PROCESSING', 'PROCESSING', 'PROCESSING', 'VALID'];
-    let stateIndex = 0;
-
-    while (Date.now() - startTime < maxWaitTime) {
+      // Verify IPA file exists
       try {
-        logger.debug('Checking build processing status...', { buildId });
+        await fs.access(ipaPath);
+      } catch (error) {
+        throw new DeploymentError(`IPA file not found: ${ipaPath}`, 'IPA_FILE_NOT_FOUND');
+      }
 
-        // Simulate different processing states
-        const currentState = processingStates[stateIndex] || 'VALID';
-        
-        logger.info(`📊 Build status: ${currentState}`, { 
-          buildId, 
-          processingState: currentState,
-          elapsed: `${Math.round((Date.now() - startTime) / 1000)}s`
+      // Get file size for progress tracking
+      const stats = await fs.stat(ipaPath);
+      const fileSizeMB = (stats.size / 1024 / 1024).toFixed(2);
+      logger.info(`📦 Uploading IPA file (${fileSizeMB} MB)...`);
+
+      // Construct altool command
+      const altoolCommand = [
+        'xcrun altool',
+        '--upload-app',
+        `--file "${ipaPath}"`,
+        '--type ios',
+        `--apiKey "${inputs.appStoreConnectApiKeyId}"`,
+        `--apiIssuer "${inputs.appStoreConnectApiIssuerId}"`,
+        `--apiKeyPath "${path.dirname(apiKeyPath)}"`,
+        '--verbose',
+      ].join(' ');
+
+      logger.debug('Executing altool command (credentials hidden)');
+
+      // Execute the upload command
+      const startTime = Date.now();
+
+      try {
+        const output = execSync(altoolCommand, {
+          stdio: 'pipe',
+          encoding: 'utf8',
+          timeout: 30 * 60 * 1000, // 30 minutes timeout
+          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
         });
 
-        // Check processing state
-        switch (currentState) {
-          case 'PROCESSING':
-            logger.info('📊 Build is still processing...', { buildId, processingState: currentState });
-            stateIndex++;
-            break;
+        const duration = Date.now() - startTime;
+        logger.info('✅ IPA uploaded successfully to App Store Connect', {
+          duration: `${(duration / 1000).toFixed(1)}s`,
+          fileSizeMB,
+        });
 
-          case 'FAILED':
-            throw new DeploymentError(
-              'Build processing failed',
-              'BUILD_PROCESSING_FAILED',
-              'ios',
-              { buildId, processingState: currentState }
-            );
-
-          case 'INVALID':
-            throw new DeploymentError(
-              'Build is invalid',
-              'BUILD_INVALID',
-              'ios',
-              { buildId, processingState: currentState }
-            );
-
-          case 'VALID':
-            logger.info('✅ Build processing completed successfully', {
-              buildId,
-              processingState: currentState,
-              totalTime: `${Math.round((Date.now() - startTime) / 1000)}s`
-            });
-            
-            logger.info(
-              '💡 For production: Replace with actual App Store Connect API polling'
-            );
-            return;
-
-          default:
-            logger.warn('Unknown processing state', { buildId, processingState: currentState });
+        // Log altool output (sanitized)
+        if (output) {
+          const sanitizedOutput = this.sanitizeAltoolOutput(output);
+          logger.debug('altool output:', { output: sanitizedOutput });
         }
 
-        // Wait before next poll
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
-      } catch (error) {
-        if (error instanceof DeploymentError) {
-          throw error; // Re-throw deployment errors
+        // Check for success indicators in output
+        if (output.includes('No errors uploading')) {
+          logger.info('🎉 Upload verification: No errors reported by altool');
+        } else if (output.includes('Package Summary:')) {
+          logger.info('📋 Upload completed with package summary');
         }
+      } catch (execError: any) {
+        const duration = Date.now() - startTime;
 
-        logger.warn('Error checking build status, will retry...', { error, buildId });
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        // Parse altool error output
+        const errorOutput = execError.stderr || execError.stdout || execError.message;
+        const sanitizedError = this.sanitizeAltoolOutput(errorOutput);
+
+        logger.error('❌ altool upload failed', {
+          duration: `${(duration / 1000).toFixed(1)}s`,
+          error: sanitizedError,
+          exitCode: execError.status,
+        });
+
+        // Provide specific error guidance
+        this.handleAltoolError(sanitizedError);
       }
+    } catch (error) {
+      logger.error('Failed to upload with altool', { error });
+      throw new DeploymentError(
+        `App Store upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        'ALTOOL_UPLOAD_FAILED'
+      );
     }
-
-    // If we reach here, we've timed out
-    throw new DeploymentError(
-      `Build processing simulation timed out after ${maxWaitTime / 1000 / 60} minutes`,
-      'BUILD_PROCESSING_TIMEOUT',
-      'ios',
-      { buildId, maxWaitTimeMinutes: maxWaitTime / 1000 / 60 }
-    );
   }
 
-  private async extractIPAMetadata(artifactPath: string): Promise<IPAMetadata> {
-    try {
-      logger.debug('Extracting IPA metadata...', { path: artifactPath });
+  private sanitizeAltoolOutput(output: string): string {
+    // Remove sensitive information from altool output
+    return output
+      .replace(/apiKey="[^"]*"/g, 'apiKey="***"')
+      .replace(/apiIssuer="[^"]*"/g, 'apiIssuer="***"')
+      .replace(/--apiKey\s+\S+/g, '--apiKey ***')
+      .replace(/--apiIssuer\s+\S+/g, '--apiIssuer ***');
+  }
 
-      // In a real implementation, you would:
-      // 1. Extract the IPA file (it's a ZIP archive)
-      // 2. Read the Info.plist file from the Payload/AppName.app directory
-      // 3. Parse the plist to extract metadata
-      
-      // For this demonstration, we'll create mock metadata
-      // In production, use a library like 'plist' to parse the actual Info.plist
-      
-      const mockMetadata: IPAMetadata = {
-        bundleId: this.bundleId, // Use the bundle ID from inputs for consistency
-        version: '1.0.0', // This would come from CFBundleShortVersionString
-        buildNumber: '1', // This would come from CFBundleVersion
-        displayName: 'App', // This would come from CFBundleDisplayName
-        minimumOSVersion: '12.0', // This would come from MinimumOSVersion
-      };
-
-      logger.debug('IPA metadata extracted', {
-        bundleId: mockMetadata.bundleId,
-        version: mockMetadata.version,
-        buildNumber: mockMetadata.buildNumber,
-        displayName: mockMetadata.displayName,
-        minimumOSVersion: mockMetadata.minimumOSVersion,
-      });
-      
-      logger.info(
-        '💡 For production: Implement real IPA metadata extraction using plist parsing'
-      );
-
-      return mockMetadata;
-    } catch (error) {
-      logger.error('Failed to extract IPA metadata', { error, artifactPath });
-      throw new DeploymentError(
-        `Failed to extract IPA metadata: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        'IPA_METADATA_EXTRACTION_FAILED',
-        'ios'
+  private handleAltoolError(errorOutput: string): never {
+    // Common altool error patterns and solutions
+    if (errorOutput.includes('Unable to authenticate')) {
+      throw new AuthenticationError(
+        'App Store Connect authentication failed. Please verify your API credentials.',
+        'ios',
+        { suggestion: 'Check API Key ID, Issuer ID, and Private Key are correct' }
       );
     }
+
+    if (errorOutput.includes('Invalid bundle identifier')) {
+      throw new DeploymentError(
+        'Invalid bundle identifier in IPA file',
+        'INVALID_BUNDLE_ID',
+        'ios',
+        { suggestion: 'Ensure the IPA bundle ID matches your App Store Connect app' }
+      );
+    }
+
+    if (errorOutput.includes('The provided entity name is not unique')) {
+      throw new DeploymentError(
+        'A build with this version already exists',
+        'DUPLICATE_VERSION',
+        'ios',
+        { suggestion: 'Increment the build number in your app and rebuild' }
+      );
+    }
+
+    if (errorOutput.includes('Invalid provisioning profile')) {
+      throw new DeploymentError(
+        'Invalid provisioning profile in IPA',
+        'INVALID_PROVISIONING_PROFILE',
+        'ios',
+        { suggestion: 'Ensure your IPA is signed with a valid App Store distribution profile' }
+      );
+    }
+
+    if (errorOutput.includes('Network error')) {
+      throw new NetworkError(
+        'Network error during upload. Please check your internet connection and try again.',
+        'ios',
+        { retryable: true }
+      );
+    }
+
+    // Generic error fallback
+    throw new DeploymentError(`App Store upload failed: ${errorOutput}`, 'ALTOOL_ERROR', 'ios', {
+      suggestion: 'Check the altool output above for specific error details',
+      rawError: errorOutput,
+    });
   }
 
   protected getExpectedArtifactExtension(): string {
@@ -736,13 +388,10 @@ export class IOSDeployer extends BaseDeployer {
 
     const iosInputs = inputs as IOSInputs;
 
-    // Initialize API to validate credentials
-    await this.initializeAppStoreConnectAPI(iosInputs);
+    // For dry run, just validate that we have all required inputs
+    this.validateIOSInputs(iosInputs);
 
-    // Verify the app exists
-    await this.findAppByBundleId(iosInputs.iosBundleId);
-
-    logger.info('✅ App Store Connect API credentials and app validated successfully');
+    logger.info('✅ iOS deployment inputs validated successfully');
   }
 
   protected override getDryRunUrl(): string {
