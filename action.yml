@@ -1,0 +1,101 @@
+name: 'Publish Store'
+description: '🚀 Professional GitHub Action for publishing mobile applications to Google Play Store and Apple App Store with enterprise-grade reliability, security, and comprehensive error handling'
+author: 'publish-store'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  # Platform Configuration
+  platform:
+    description: 'Target platform for deployment (android or ios)'
+    required: true
+
+  # Application Configuration
+  app-version:
+    description: 'Application version (e.g., 1.2.3, follows semantic versioning)'
+    required: true
+
+  build-number:
+    description: 'Build number for the release (auto-generated if not provided)'
+    required: false
+
+  release-notes:
+    description: 'Release notes for the deployment'
+    required: false
+    default: ''
+
+  # Artifact Configuration
+  artifact-path:
+    description: 'Path to the app artifact (AAB/APK for Android, IPA for iOS)'
+    required: true
+
+  # Android Configuration (Google Play Store)
+  google-play-service-account-json:
+    description: 'Google Play service account JSON key (base64 encoded for security)'
+    required: false
+
+  google-play-package-name:
+    description: 'Android package name for Google Play Store (e.g., com.company.app)'
+    required: false
+
+  google-play-track:
+    description: 'Release track for Google Play (production, beta, alpha, internal)'
+    required: false
+    default: 'internal'
+
+  # iOS Configuration (App Store Connect)
+  app-store-connect-api-key-id:
+    description: 'App Store Connect API Key ID (10-character alphanumeric string)'
+    required: false
+
+  app-store-connect-api-issuer-id:
+    description: 'App Store Connect API Issuer ID (UUID format)'
+    required: false
+
+  app-store-connect-api-private-key:
+    description: 'App Store Connect API Private Key (base64 encoded .p8 file)'
+    required: false
+
+  ios-bundle-id:
+    description: 'iOS bundle identifier (e.g., com.company.app)'
+    required: false
+
+  # Optional Configuration
+  skip-duplicate-version-check:
+    description: 'Skip checking for duplicate versions in the store'
+    required: false
+    default: 'false'
+
+  dry-run:
+    description: 'Perform validation and testing without actual deployment'
+    required: false
+    default: 'false'
+
+  timeout-minutes:
+    description: 'Maximum time to wait for deployment completion (in minutes)'
+    required: false
+    default: '30'
+
+outputs:
+  success:
+    description: 'Whether the deployment was successful (true/false)'
+
+  platform:
+    description: 'The platform that was deployed to (android/ios)'
+
+  version:
+    description: 'The version that was deployed'
+
+  build-number:
+    description: 'The build number assigned by the store'
+
+  url:
+    description: 'Direct URL to the app in the store (when available)'
+
+  deployment-summary:
+    description: 'Comprehensive JSON summary of the deployment results including timing, errors, and metadata'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

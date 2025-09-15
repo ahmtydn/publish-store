@@ -1,0 +1,105 @@
+{
+  "name": "publish-store",
+  "version": "1.0.0",
+  "description": "Professional GitHub Action for publishing mobile apps to Google Play Store and Apple App Store",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "npm run clean && npm run compile && npm run bundle",
+    "clean": "rimraf dist lib coverage",
+    "compile": "tsc",
+    "bundle": "rollup --config rollup.config.ts --configPlugin @rollup/plugin-typescript",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:integration": "jest --config jest.integration.config.js",
+    "test:e2e": "jest --config jest.e2e.config.js",
+    "lint": "eslint 'src/**/*.ts' '__tests__/**/*.ts'",
+    "lint:fix": "eslint 'src/**/*.ts' '__tests__/**/*.ts' --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "validate": "npm run typecheck && npm run lint && npm run test",
+    "dev": "npm run compile -- --watch",
+    "prepare": "husky install",
+    "semantic-release": "semantic-release"
+  },
+  "keywords": [
+    "github-actions",
+    "mobile-deployment",
+    "android",
+    "ios",
+    "google-play",
+    "app-store",
+    "publishing",
+    "ci-cd",
+    "automation",
+    "enterprise"
+  ],
+  "author": {
+    "name": "Ahmet Aydın",
+    "email": "ahmet@ahmetaydin.dev",
+    "url": "https://github.com/ahmtydn"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ahmtydn/publish-store.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ahmtydn/publish-store/issues"
+  },
+  "homepage": "https://github.com/ahmtydn/publish-store#readme",
+  "dependencies": {
+    "@actions/core": "^1.10.1",
+    "@actions/github": "^6.0.0",
+    "@google-cloud/storage": "^7.7.0",
+    "axios": "^1.6.5",
+    "form-data": "^4.0.0",
+    "googleapis": "^131.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "semver": "^7.5.4",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.7",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-typescript": "^11.1.6",
+    "@types/jest": "^29.5.11",
+    "@types/jsonwebtoken": "^9.0.5",
+    "@types/node": "^20.11.5",
+    "@types/semver": "^7.5.6",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "eslint": "^8.56.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-jest": "^27.6.3",
+    "husky": "^8.0.3",
+    "jest": "^29.7.0",
+    "lint-staged": "^15.2.0",
+    "prettier": "^3.2.4",
+    "rimraf": "^5.0.5",
+    "rollup": "^4.9.6",
+    "semantic-release": "^22.0.12",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3"
+  },
+  "lint-staged": {
+    "*.{ts,js}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ]
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged",
+      "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
+    }
+  }
+}

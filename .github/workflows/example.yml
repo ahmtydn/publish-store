@@ -1,0 +1,69 @@
+name: Deploy Mobile App
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  deploy-android:
+    name: Deploy to Google Play Store
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android App
+        run: |
+          # Your Android build commands here
+          # ./gradlew assembleRelease or ./gradlew bundleRelease
+          echo "Building Android app..."
+
+      - name: Deploy to Google Play Store
+        uses: ahmtydn/publish-store@v1
+        with:
+          platform: 'android'
+          app-version: ${{ github.ref_name }}
+          artifact-path: './app/build/outputs/bundle/release/app-release.aab'
+          google-play-service-account-json: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          google-play-package-name: 'com.yourcompany.yourapp'
+          google-play-track: 'internal'
+          dry-run: false
+
+  deploy-ios:
+    name: Deploy to App Store Connect
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build iOS App
+        run: |
+          # Your iOS build commands here
+          # xcodebuild -workspace YourApp.xcworkspace -scheme YourApp archive
+          echo "Building iOS app..."
+
+      - name: Deploy to App Store Connect
+        uses: ahmtydn/publish-store@v1
+        with:
+          platform: 'ios'
+          app-version: ${{ github.ref_name }}
+          artifact-path: './build/YourApp.ipa'
+          app-store-connect-api-key-id: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          app-store-connect-api-issuer-id: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          app-store-connect-api-private-key: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY }}
+          ios-bundle-id: 'com.yourcompany.yourapp'
+          dry-run: false
